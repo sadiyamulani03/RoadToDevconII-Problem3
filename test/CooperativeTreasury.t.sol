@@ -150,4 +150,31 @@ contract CooperativeTreasuryTest is Test {
         vm.prank(memberC);
         treasury.withdraw(2);
     }
+
+    function test_NoDoubleWithdrawalAndDustHandled() public {
+        // 7th check: no double withdrawal, 5th check: dust tracked
+        vm.prank(buyer);
+        treasury.deposit{value: 10001}(); // 10001 % 10000 = 1 wei dust
+
+        uint256 balBefore = memberA.balance;
+        vm.prank(memberA);
+        treasury.withdraw(1);
+        uint256 balAfter = memberA.balance;
+        assertEq(balAfter - balBefore, 4000); // 10001*4000/10000 = 4000 (floor)
+
+        // second withdraw same payment must revert
+        vm.prank(memberA);
+        vm.expectRevert("Already withdrawn");
+        treasury.withdraw(1);
+
+        // dust is tracked, not lost - remains in contract and is sweepable
+        assertEq(treasury.paymentRemainder(1), 10001 - 4000); // not yet fully claimed but tracked
+        // after all three withdraw, dust = 1 wei stays in treasury
+        vm.prank(memberB);
+        treasury.withdraw(1);
+        vm.prank(memberC);
+        treasury.withdraw(1);
+        assertEq(treasury.paymentRemainder(1), 1);
+        assertEq(address(treasury).balance, 1);
+    }
 }
