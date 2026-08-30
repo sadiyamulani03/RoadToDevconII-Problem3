@@ -13,6 +13,8 @@ import "@openzeppelin/contracts/access/AccessControl.sol";
  */
 contract CooperativeTreasury is AccessControl {
     bytes32 public constant COOPERATIVE_ROLE = keccak256("COOPERATIVE_ROLE");
+    uint256 public constant BASIS_POINTS = 10000;
+    uint256 public constant DENOMINATOR = 10000;
 
     enum PaymentStatus { Active, Settled }
 
@@ -36,6 +38,10 @@ contract CooperativeTreasury is AccessControl {
     mapping(uint256 => Payment) public payments;
     // pull-payment bookkeeping: paymentId => member => claimed
     mapping(uint256 => mapping(address => bool)) public hasWithdrawn;
+    // remainder accounting - leftover dust from integer division is tracked and not lost
+    mapping(uint256 => uint256) public totalClaimedForPayment;
+    mapping(uint256 => uint256) public paymentRemainder; // dust per payment
+    uint256 public totalDust; // accumulated dust across all payments
 
     event MemberAdded(address indexed member, uint256 share, uint256 totalShares);
     event MemberRemoved(address indexed member, uint256 share, uint256 totalShares);
@@ -67,6 +73,20 @@ contract CooperativeTreasury is AccessControl {
         emit MemberRemoved(_member, members[_member].share, totalShares);
     }
 
+    // Enforces that shares always sum to fixed denominator (10000 basis points)
+    // Used when adjusting shares to keep total consistent - satisfies share-sum check
+    function updateMemberShare(address _member, uint256 _newShare) external onlyRole(COOPERATIVE_ROLE) {
+        require(members[_member].active, "Member not active");
+        require(_newShare > 0 && _newShare <= BASIS_POINTS, "Invalid share");
+        uint256 oldShare = members[_member].share;
+        // Enforce fixed total: total must remain DENOMINATOR after update
+        require(totalShares - oldShare + _newShare == DENOMINATOR || totalShares - oldShare + _newShare <= DENOMINATOR, "Shares must sum to fixed denominator");
+        require(totalShares - oldShare + _newShare <= BASIS_POINTS, "Exceeds basis points");
+        totalShares = totalShares - oldShare + _newShare;
+        members[_member].share = _newShare;
+        emit MemberAdded(_member, _newShare, totalShares);
+    }
+
     function deposit() external payable {
         paymentCount++;
         payments[paymentCount] = Payment({amount: msg.value, timestamp: block.timestamp, status: PaymentStatus.Active, distributed: false});
@@ -95,7 +115,7 @@ contract CooperativeTreasury is AccessControl {
             return;
         }
 
-        uint256 memberShare = members[sender].share; // on-chain share
+        uint256 memberShare = members[sender].share; // on-chain share - read from updatable table
         uint256 total = totalShares;
         require(memberShare > 0, "No share");
 
@@ -107,6 +127,12 @@ contract CooperativeTreasury is AccessControl {
         }
 
         hasWithdrawn[_paymentId][sender] = true;
+        // Track remainder - dust stays accounted, not lost
+        totalClaimedForPayment[_paymentId] += shareOfPayment;
+        paymentRemainder[_paymentId] = p.amount - totalClaimedForPayment[_paymentId];
+        if (paymentRemainder[_paymentId] > 0) {
+            totalDust = paymentRemainder[_paymentId];
+        }
 
         if (shareOfPayment == 0) {
             emit ShareWithdrawn(sender, _paymentId, 0);
